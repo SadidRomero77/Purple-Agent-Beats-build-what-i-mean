@@ -16,8 +16,8 @@ from agent.grid import (
     VALID_X, VALID_Z, VALID_Y, VALID_COLORS,
     parse_blocks, blocks_to_string, normalize_block_set,
 )
-from agent.instruction_parser import parse_message, detect_ambiguity_type
-from agent.speaker_model import SpeakerModel
+from agent.instruction_parser import parse_message
+from agent.speaker_model import SpeakerModel, SpeakerHistory
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,26 @@ Given an instruction and optionally existing blocks on the grid, determine the C
 4. Colors must be capitalized: Red, Blue, Green, Yellow, Purple
 5. Think step-by-step about spatial positions before giving coordinates
 6. When stacking, ensure blocks below exist first
+
+## EXAMPLES
+
+### Example 1 — Relative positioning
+Start blocks: Blue,0,50,0
+Instruction: "Add a red block to the right of the existing block"
+Reasoning: "Right" = positive X direction. Blue block is at x=0, so one step right is x=100. Same row (z=0), ground level (y=50).
+Output: {"reasoning": "Right of x=0 is x=100, same z=0, ground y=50", "blocks": [{"color": "Blue", "x": 0, "y": 50, "z": 0}, {"color": "Red", "x": 100, "y": 50, "z": 0}]}
+
+### Example 2 — Stacking
+Start blocks: Red,200,50,-100
+Instruction: "Stack a green block on top of it"
+Reasoning: "On top" = same x,z position, y increases by 100. Red is at y=50, so green goes at y=150.
+Output: {"reasoning": "Same x=200, z=-100. On top of y=50 means y=150", "blocks": [{"color": "Red", "x": 200, "y": 50, "z": -100}, {"color": "Green", "x": 200, "y": 150, "z": -100}]}
+
+### Example 3 — Ambiguous color (conservative interpretation)
+Start blocks: Yellow,-100,50,0
+Instruction: "Place two more blocks next to it"
+Reasoning: Color not specified → use same color as existing block (Yellow, conservative). "Next to" = adjacent in x or z. Place at x=-200,z=0 and x=0,z=0.
+Output: {"reasoning": "No color given, use Yellow. Adjacent to x=-100 are x=-200 and x=0", "blocks": [{"color": "Yellow", "x": -100, "y": 50, "z": 0}, {"color": "Yellow", "x": -200, "y": 50, "z": 0}, {"color": "Yellow", "x": 0, "y": 50, "z": 0}]}
 
 ## OUTPUT FORMAT
 Respond with ONLY a JSON object:
@@ -123,6 +143,7 @@ class BuilderAgent:
         self.used_conservative: bool = False
         self.last_was_ask: bool = False
         self.pending_answer: str | None = None
+        self.last_built_blocks: str = ""  # tracks last response for history
         self.round_count: int = 0
         self.game_count: int = 0
 
@@ -148,12 +169,10 @@ class BuilderAgent:
         if parsed.is_answer:
             self.pending_answer = parsed.answer_text
             logger.info(f"Received answer: {self.pending_answer}")
-            # Now build using the answer as additional context
             return await self._build_with_context()
 
         # Handle invalid format feedback
         if "Invalid response format" in text:
-            # Retry with the current instruction
             if self.current_instruction:
                 return await self._build_with_context()
             return "[BUILD];"
@@ -167,37 +186,29 @@ class BuilderAgent:
             self.pending_answer = None
             self.last_was_ask = False
 
-            # Detect ambiguity
-            self.current_ambiguity_type = detect_ambiguity_type(
-                parsed.instruction_text, parsed.start_blocks
-            )
-
             logger.info(
                 f"Round {self.round_count}: Speaker={self.current_speaker}, "
-                f"Ambiguity={self.current_ambiguity_type}, "
                 f"Instruction={parsed.instruction_text[:100]}"
             )
 
-            # Decide whether to ask a question
-            should_ask = self.speaker_model.should_ask_question(
-                self.current_speaker, self.current_ambiguity_type
-            )
+            # MEJORA #1: Always evaluate with LLM — no rigid heuristic
+            ambiguity_type, question = await self._evaluate_instruction()
+            self.current_ambiguity_type = ambiguity_type
 
-            if should_ask and self.current_ambiguity_type != "fully_spec":
-                question = await self._generate_question()
-                if question:
-                    self.last_was_ask = True
-                    return f"[ASK];{question}"
+            logger.info(f"LLM detected ambiguity: {ambiguity_type}")
 
-            # Build directly
+            if question:
+                self.last_was_ask = True
+                return f"[ASK];{question}"
+
             return await self._build_with_context()
 
-        # Fallback - try to build with whatever we have
+        # Fallback
         logger.warning(f"Unrecognized message format: {text[:200]}")
         return "[BUILD];"
 
     def _process_feedback(self, parsed):
-        """Update speaker model based on feedback."""
+        """Update speaker model and save round to conversation history."""
         if self.current_speaker and parsed.feedback_correct is not None:
             self.speaker_model.record_result(
                 speaker_name=self.current_speaker,
@@ -212,15 +223,56 @@ class BuilderAgent:
                 f"total={parsed.feedback_total}"
             )
 
-    async def _generate_question(self) -> str | None:
-        """Generate a strategic clarification question using LLM."""
-        speaker = self.speaker_model.get_speaker(self.current_speaker)
-        speaker_context = (
-            f"Speaker '{self.current_speaker}' - "
-            f"rounds seen: {speaker.total_rounds}, "
-            f"reliability: {'unknown' if speaker.ambiguous_rounds < 2 else ('reliable' if speaker.is_likely_reliable else 'unreliable')}"
+            # MEJORA #3: Append completed round to conversation history
+            if self.current_instruction:
+                self.conversation_history.append({
+                    "round": self.round_count,
+                    "speaker": self.current_speaker,
+                    "instruction": self.current_instruction,
+                    "built": self.last_built_blocks,
+                    "correct": parsed.feedback_correct,
+                    "score": parsed.feedback_score,
+                })
+                # Keep only last 5 rounds to avoid prompt bloat
+                if len(self.conversation_history) > 5:
+                    self.conversation_history.pop(0)
+
+    def _build_speaker_context(self, speaker: SpeakerHistory) -> str:
+        """Build rich speaker context string for LLM prompts."""
+        if speaker.total_rounds == 0:
+            return f"Speaker '{speaker.name}': No history yet. Assume standard cooperative communication."
+
+        reliability = "unknown"
+        if speaker.is_likely_reliable:
+            reliability = "reliable/consistent (tends to use same color as existing blocks, literal quantities)"
+        elif speaker.is_likely_unreliable:
+            reliability = "unpredictable (mixes conservative and liberal interpretations)"
+
+        context = (
+            f"Speaker '{speaker.name}': {speaker.total_rounds} rounds seen, "
+            f"{speaker.correct_rounds} correct ({speaker.accuracy:.0%} accuracy), "
+            f"reliability: {reliability}."
         )
 
+        if speaker.ambiguous_rounds > 0:
+            context += (
+                f" On {speaker.ambiguous_rounds} ambiguous instructions: "
+                f"{speaker.ambiguous_correct_conservative} correct with conservative interpretation "
+                f"(same color/fewer blocks), "
+                f"{speaker.ambiguous_correct_liberal} correct with liberal interpretation "
+                f"(different color/more blocks)."
+            )
+
+        return context
+
+    async def _evaluate_instruction(self) -> tuple[str, str | None]:
+        """
+        MEJORA #1: Always evaluate instruction ambiguity with LLM.
+        Replaces the rigid keyword heuristic that previously blocked this path.
+        Returns (ambiguity_type, question_to_ask_or_None).
+        """
+        speaker = self.speaker_model.get_speaker(self.current_speaker or "unknown")
+        speaker_context = self._build_speaker_context(speaker)
         start_str = blocks_to_string(self.current_start_blocks) if self.current_start_blocks else "(empty grid)"
 
         prompt = QUESTION_DECISION_PROMPT.format(
@@ -242,57 +294,73 @@ class BuilderAgent:
             )
 
             result = json.loads(response.choices[0].message.content)
+            ambiguity_type = result.get("ambiguity_type", "fully_spec")
 
-            if result.get("should_ask") and result.get("question"):
-                return result["question"]
+            # Ask only if both LLM and speaker model agree it's worth the -5 cost
+            llm_should_ask = result.get("should_ask", False) and bool(result.get("question", "").strip())
+            speaker_allows_ask = self.speaker_model.should_ask_question(self.current_speaker, ambiguity_type)
+
+            if llm_should_ask and speaker_allows_ask:
+                return ambiguity_type, result["question"]
+
+            return ambiguity_type, None
 
         except Exception as e:
-            logger.error(f"Error generating question: {e}")
-
-        return None
+            logger.error(f"Error evaluating instruction: {e}")
+            return "fully_spec", None
 
     async def _build_with_context(self) -> str:
         """Build the structure using LLM reasoning."""
         if not self.current_instruction:
             return "[BUILD];"
 
-        # Build the context for the LLM
         start_str = blocks_to_string(self.current_start_blocks) if self.current_start_blocks else "(no blocks)"
 
-        # Add speaker model context for ambiguous instructions
+        # Speaker hint — no longer gated behind ambiguous_rounds >= 2
         speaker_hint = ""
         if self.current_speaker and self.current_ambiguity_type != "fully_spec":
             pref = self.speaker_model.get_interpretation_preference(
                 self.current_speaker, self.current_ambiguity_type
             )
             speaker = self.speaker_model.get_speaker(self.current_speaker)
+            speaker_context = self._build_speaker_context(speaker)
 
-            if speaker.ambiguous_rounds >= 2:
-                if pref == "conservative":
-                    speaker_hint = (
-                        "\n\nSPEAKER CONTEXT: This speaker tends to be consistent/literal. "
-                        "For ambiguous colors, prefer using the same color as existing blocks. "
-                        "For ambiguous quantities, prefer the smaller/literal number."
-                    )
-                else:
-                    speaker_hint = (
-                        "\n\nSPEAKER CONTEXT: This speaker is unpredictable with ambiguous instructions. "
-                        "For ambiguous colors, they might mean a different color than existing blocks. "
-                        "For ambiguous quantities, they might mean more blocks than literally stated."
-                    )
+            if pref == "conservative":
+                speaker_hint = (
+                    f"\n\nSPEAKER CONTEXT ({self.current_ambiguity_type}): {speaker_context} "
+                    f"Use conservative interpretation: same color as existing blocks, literal/smaller quantities."
+                )
+            else:
+                speaker_hint = (
+                    f"\n\nSPEAKER CONTEXT ({self.current_ambiguity_type}): {speaker_context} "
+                    f"Use liberal interpretation: may mean a different color or more blocks than literally stated."
+                )
             self.used_conservative = (pref == "conservative")
         else:
-            self.used_conservative = True  # default
+            self.used_conservative = True
 
-        # Build the user prompt
+        # Clarification answer context
         answer_context = ""
         if self.pending_answer:
-            answer_context = f"\n\nCLARIFICATION ANSWER: I asked a question and received: \"{self.pending_answer}\"\nUse this information to resolve any ambiguity."
+            answer_context = (
+                f"\n\nCLARIFICATION ANSWER: I asked a question and received: \"{self.pending_answer}\"\n"
+                f"Use this information to resolve any ambiguity."
+            )
+
+        # MEJORA #3: Include recent rounds from conversation history
+        history_context = ""
+        if self.conversation_history:
+            history_lines = []
+            for entry in self.conversation_history[-3:]:
+                result_str = "Correct" if entry["correct"] else "Incorrect"
+                history_lines.append(
+                    f"  Round {entry['round']} [{entry['speaker']}]: \"{entry['instruction']}\" -> {result_str}"
+                )
+            history_context = "\n\nPREVIOUS ROUNDS THIS GAME (use for spatial and speaker context):\n" + "\n".join(history_lines)
 
         user_prompt = f"""INSTRUCTION: {self.current_instruction}
 
-EXISTING BLOCKS ON GRID (START_STRUCTURE): {start_str}
-{speaker_hint}{answer_context}
+EXISTING BLOCKS ON GRID (START_STRUCTURE): {start_str}{speaker_hint}{answer_context}{history_context}
 
 Remember: Output ALL blocks that should be on the grid after following the instruction (including the start blocks if they should remain). Respond with ONLY the JSON object."""
 
@@ -349,6 +417,7 @@ Remember: Output ALL blocks that should be on the grid after following the instr
                     unique_blocks.append(block)
 
             block_str = blocks_to_string(unique_blocks)
+            self.last_built_blocks = block_str  # MEJORA #3: store for history
             return f"[BUILD];{block_str}"
 
         except json.JSONDecodeError as e:
@@ -363,7 +432,6 @@ Remember: Output ALL blocks that should be on the grid after following the instr
 
     def _fallback_parse(self, content: str) -> str:
         """Try to extract block coordinates from a non-JSON LLM response."""
-        # Try to find coordinate patterns like Color,x,y,z
         pattern = r'(Red|Blue|Green|Yellow|Purple),\s*(-?\d+),\s*(\d+),\s*(-?\d+)'
         matches = re.findall(pattern, content, re.IGNORECASE)
         if matches:
@@ -372,7 +440,6 @@ Remember: Output ALL blocks that should be on the grid after following the instr
                 blocks.append((color.capitalize(), int(x), int(y), int(z)))
             return f"[BUILD];{blocks_to_string(blocks)}"
 
-        # Last resort - return start blocks
         if self.current_start_blocks:
             return "[BUILD];" + blocks_to_string(self.current_start_blocks)
         return "[BUILD];"
