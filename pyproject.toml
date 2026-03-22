@@ -1,27 +1,13 @@
 [project]
-name = "purple-builder-agent"
-version = "1.0.0"
-description = "A high-performance purple agent for the build_what_i_mean benchmark - AgentBeats Phase 2"
+name = "agente-purpura-v2"
+version = "0.1.0"
+description = "Arquitectura base de Agente Purpura v2: teoria de juegos + filosofia de la mente"
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = [
-    "a2a-sdk[http-server]>=0.3.20",
-    "uvicorn>=0.34.0",
-    "httpx>=0.28.0",
-    "anthropic>=0.52.0",
-    "openai>=1.70.0",
-    "litellm>=1.60.0",
-]
+requires-python = ">=3.10"
+dependencies = []
 
-[project.optional-dependencies]
-test = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24.0",
-]
+[tool.setuptools]
+package-dir = {"" = "src"}
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src"]
+[tool.setuptools.packages.find]
+where = ["src"]
