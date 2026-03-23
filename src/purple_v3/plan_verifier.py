@@ -47,6 +47,9 @@ def verify_plan(
     # Check 4: Block count sanity
     _check_block_count(lower, steps, result)
 
+    # Check 5: Ground-level placement when no stacking intended
+    _check_ground_level(lower, steps, result)
+
     return result
 
 
@@ -134,6 +137,31 @@ def _check_block_count(lower: str, steps: List[BuildStep], result: VerificationR
             f"Plan produces ~{total_planned} blocks but instruction mentions {numbers}. "
             f"This seems excessive. Double-check counts."
         )
+
+
+def _check_ground_level(lower: str, steps: List[BuildStep], result: VerificationResult):
+    """Check that non-stacking placements produce ground-level blocks.
+
+    If the instruction doesn't say 'stack', 'on top', or 'tower' for a
+    particular placement, the blocks should be at ground level (y=50).
+    This catches the bug where caps on T-shape crossbar ends get stacked
+    at y=150 instead of placed at y=50.
+    """
+    has_stack_context = bool(re.search(r'\b(stack|tower|on\s+top)\b', lower))
+
+    # If the instruction is explicitly about stacking, don't flag
+    if has_stack_context:
+        return
+
+    # Check for place/extend_row steps that might accidentally stack
+    for step in steps:
+        if step.action in ("place", "place_relative") and isinstance(step.count, int) and step.count > 1:
+            result.issues.append(
+                f"Step places {step.count} blocks with action='{step.action}' "
+                f"but instruction doesn't mention stacking. Use action='extend_row' "
+                f"for horizontal placement or action='stack' if vertical."
+            )
+            result.has_critical = True
 
 
 # ─── Auto-fix functions ───
@@ -316,5 +344,20 @@ def auto_fix_t_shape_extend(
                 offset = DIRECTION_OFFSETS.get(correct_dir, (0, 0))
                 step.position["x"] = stem_tip[0] + offset[0]
                 step.position["z"] = stem_tip[1] + offset[1]
+
+    # Fix cap positions at crossbar ends (if "each end" mentioned)
+    if re.search(r'\b(each|both)\s+(end|side)s?\b', lower):
+        crossbar_start = t["crossbar_start"]
+        crossbar_end = t["crossbar_end"]
+        cap_steps = [s for s in steps if s.action in ("stack", "place") and s != steps[0]]
+
+        if len(cap_steps) >= 2:
+            # Ensure caps are at the actual crossbar endpoints
+            cap_steps[0].position["x"] = crossbar_start[0]
+            cap_steps[0].position["z"] = crossbar_start[1]
+            cap_steps[1].position["x"] = crossbar_end[0]
+            cap_steps[1].position["z"] = crossbar_end[1]
+            logger.info("Auto-fix T-shape caps: placed at crossbar endpoints (%d,%d) and (%d,%d)",
+                        crossbar_start[0], crossbar_start[1], crossbar_end[0], crossbar_end[1])
 
     return steps

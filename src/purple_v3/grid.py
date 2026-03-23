@@ -127,7 +127,7 @@ class Grid:
     def most_common_color(self) -> str:
         """Return the most common color on the grid."""
         if not self.blocks:
-            return "Purple"
+            return "Red"
         counts: Dict[str, int] = {}
         for b in self.blocks:
             counts[b.color] = counts.get(b.color, 0) + 1

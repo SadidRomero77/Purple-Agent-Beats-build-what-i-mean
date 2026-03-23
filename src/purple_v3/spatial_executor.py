@@ -158,7 +158,13 @@ class SpatialExecutor:
         logger.debug("Placed %s relative at (%d,%d)", color, x, z)
 
     def _exec_extend_row(self, step: BuildStep) -> None:
-        """Place N blocks in a line from start position in a direction."""
+        """Place N blocks in a line from start position in a direction.
+
+        Fixed: removed auto-advance that caused off-by-one errors.
+        The planner is responsible for correct start positions.
+        We only skip positions that already have a block at ground level
+        to avoid duplicates, but we don't shift the start.
+        """
         x, z = self._resolve_position(step)
         color = self._resolve_color(step.color)
         count = self._resolve_count(step.count, step)
@@ -166,29 +172,30 @@ class SpatialExecutor:
 
         offset = DIRECTION_OFFSETS.get(direction, (100, 0))
 
-        # If starting position already has a block of the same color, advance one step
-        existing = self.grid.blocks_at(x, z)
-        if existing and any(b.color == color for b in existing):
-            x += offset[0]
-            z += offset[1]
-
-        for i in range(count):
+        placed = 0
+        for i in range(count + 4):  # allow extra iterations to skip occupied cells
             bx = x + offset[0] * i
             bz = z + offset[1] * i
             # Validate bounds
             if bx < self.grid.config.x_min or bx > self.grid.config.x_max:
-                logger.warning("extend_row: x=%d out of bounds, stopping", bx)
                 break
             if bz < self.grid.config.z_min or bz > self.grid.config.z_max:
-                logger.warning("extend_row: z=%d out of bounds, stopping", bz)
                 break
+            # Skip positions that already have this color at ground level
+            existing = self.grid.blocks_at(bx, bz)
+            if existing and any(b.color == color and b.y == self.grid.config.y_ground for b in existing):
+                continue
             self.grid.add_block(color, bx, bz)
+            placed += 1
+            if placed >= count:
+                break
 
-        # Track last position
-        last_x = x + offset[0] * (count - 1)
-        last_z = z + offset[1] * (count - 1)
-        self._last_position_by_color[color] = (last_x, last_z)
-        logger.debug("Extended row of %d %s from (%d,%d) %s", count, color, x, z, direction)
+        # Track last placed position
+        if placed > 0:
+            last_x = bx
+            last_z = bz
+            self._last_position_by_color[color] = (last_x, last_z)
+        logger.debug("Extended row of %d %s from (%d,%d) %s (placed %d)", count, color, x, z, direction, placed)
 
     def _exec_place_at_corners(self, step: BuildStep) -> None:
         """Place blocks at grid corners."""

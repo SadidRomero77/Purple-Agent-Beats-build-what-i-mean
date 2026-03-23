@@ -73,23 +73,43 @@ async def detect_ambiguity_llm(
 
 
 def _infer_color_from_context(instruction: str, grid: Grid) -> str:
-    """Infer a color from the instruction or grid context."""
+    """Infer the most likely color for unspecified blocks.
+
+    Priority order:
+    1. If instruction has exactly one color → use that color
+    2. If instruction has multiple colors → use the LAST mentioned color
+       (the colorless phrase usually follows the last colored one)
+    3. If grid has blocks → use the most common color on the grid
+    4. If grid has blocks from instruction colors → use the one closest
+       to the colorless phrase position
+    5. Last resort → use "Red" (most common in stimulus data, never "Purple")
+    """
     lower = instruction.lower()
 
-    # Find colors mentioned in instruction
+    # Find colors mentioned in instruction, preserving order of appearance
     instruction_colors = []
-    for color in KNOWN_COLORS:
-        if re.search(r'\b' + color + r'\b', lower):
-            instruction_colors.append(color.capitalize())
+    for m in re.finditer(
+        r'\b(' + '|'.join(KNOWN_COLORS) + r')\b', lower
+    ):
+        c = m.group(1).capitalize()
+        if c not in instruction_colors:
+            instruction_colors.append(c)
 
     if len(instruction_colors) == 1:
         return instruction_colors[0]
 
-    # Fall back to most common color on grid
+    if len(instruction_colors) > 1:
+        # Use the last mentioned color — colorless phrases typically follow
+        # the last colored clause and refer to the same context
+        return instruction_colors[-1]
+
+    # No colors in instruction — use grid context
     if grid.blocks:
         return grid.most_common_color()
 
-    return "Purple"
+    # Absolute last resort — "Red" is the most common color in the game,
+    # never default to "Purple" which is rarely the intended answer
+    return "Red"
 
 
 def _detect_ambiguity_heuristic(instruction: str, grid: Grid) -> AmbiguityInfo:

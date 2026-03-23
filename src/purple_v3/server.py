@@ -33,6 +33,7 @@ from purple_v3.build_planner import BuildPlanner, BuildStep
 from purple_v3.spatial_executor import SpatialExecutor, ExecutionError
 from purple_v3.ambiguity_detector import (
     detect_ambiguity_llm,
+    _infer_color_from_context,
     patch_instruction_with_color,
     patch_instruction_with_count,
 )
@@ -149,11 +150,19 @@ class PurpleAgent(AgentExecutor):
         self._planner = BuildPlanner(self._client, self._model, self._config)
         # Per-context state
         self._history: dict[str, list[dict]] = {}
-        self._max_history = 5
+        self._max_history = 10  # Increased from 5 for more context
         self._pending: dict[str, dict] = {}
         self._asked: set[str] = set()
+        # Cross-round feedback cache: maps instruction pattern → correction
+        self._feedback_cache: dict[str, str] = {}
 
     # ── Answer extraction ──
+
+    @classmethod
+    def _count_instruction_colors(cls, text: str) -> int:
+        """Count unique colors mentioned in instruction text."""
+        lower = text.lower()
+        return sum(1 for c in cls._COLOR_NAMES if re.search(r'\b' + c + r'\b', lower))
 
     @classmethod
     def _extract_answer_colors(cls, text: str) -> list[str]:
@@ -203,6 +212,21 @@ class PurpleAgent(AgentExecutor):
 
         # Handle feedback / transition messages
         if parsed.is_feedback:
+            # Cache negative feedback for cross-round learning
+            feedback_lower = parsed.feedback_text.lower()
+            if "incorrect" in feedback_lower or "-10" in feedback_lower:
+                # Get last instruction for this context and cache the failure
+                last_instructions = [
+                    e for e in self._history.get(ctx_id, [])
+                    if e["type"] == "instruction"
+                ]
+                if last_instructions:
+                    key = self._instruction_key(last_instructions[-1]["content"])
+                    self._feedback_cache[key] = (
+                        f"PREVIOUS ATTEMPT FAILED on similar instruction. "
+                        f"Feedback was: {parsed.feedback_text[:200]}. "
+                        f"Try a different approach."
+                    )
             self._add_history(ctx_id, "feedback", parsed.feedback_text)
             self._pending.pop(ctx_id, None)
             self._asked.discard(ctx_id)
@@ -322,25 +346,27 @@ class PurpleAgent(AgentExecutor):
 
             inferred_count = override_count or ambiguity.inferred_count or 3
 
-            # Compound ask (both color and count missing)
-            if (
-                ambiguity.has_missing_color
-                and ambiguity.has_missing_count
-                and ctx_id not in self._asked
-            ):
-                self._pending[ctx_id] = {
-                    "parsed": parsed,
-                    "original_input": original_input,
-                    "ask_type": "compound",
-                }
-                q = (
-                    f"{ambiguity.suggested_color_question} "
-                    f"Also, {ambiguity.suggested_count_question.lower()}"
-                )
-                return f"[ASK];{q}"
+            # ── ASK strategy (EV-based) ──
+            # NEVER ask about count: -5 penalty rarely justified, infer instead.
+            # Only ask about color when there's genuine ambiguity:
+            #   - Instruction has 0 colors AND grid has 2+ colors (can't guess)
+            #   - Instruction has 2+ colors AND colorless phrase (unclear which)
+            # Single-color instructions: just reuse that color (don't ask).
 
-            # Color-only ask
+            should_ask_color = False
             if ambiguity.has_missing_color and ctx_id not in self._asked:
+                instruction_colors = self._count_instruction_colors(parsed.instruction_text)
+                grid_colors = len(parsed.start_grid.unique_colors()) if parsed.start_grid.blocks else 0
+
+                if instruction_colors == 0 and grid_colors >= 2:
+                    # No color clue at all, grid has multiple — must ask
+                    should_ask_color = True
+                elif instruction_colors >= 2:
+                    # Multiple colors mentioned, unclear which applies — ask
+                    should_ask_color = True
+                # Single color in instruction or single grid color → infer, don't ask
+
+            if should_ask_color:
                 self._pending[ctx_id] = {
                     "parsed": parsed,
                     "original_input": original_input,
@@ -348,26 +374,16 @@ class PurpleAgent(AgentExecutor):
                 }
                 return f"[ASK];{ambiguity.suggested_color_question}"
 
-            # Count-only ask
-            if (
-                ambiguity.has_missing_count
-                and not ambiguity.has_missing_color
-                and ctx_id not in self._asked
-                and override_count is None
-            ):
-                self._pending[ctx_id] = {
-                    "parsed": parsed,
-                    "original_input": original_input,
-                    "ask_type": "count",
-                }
-                return f"[ASK];{ambiguity.suggested_count_question}"
-
-            # Already asked — fill with inferred values
+            # Fill missing color with inferred value (never ask)
             if ambiguity.has_missing_color:
-                fill = ambiguity.inferred_color or "Purple"
+                fill = ambiguity.inferred_color or _infer_color_from_context(
+                    parsed.instruction_text, parsed.start_grid
+                )
                 parsed.instruction_text = patch_instruction_with_color(
                     parsed.instruction_text, fill
                 )
+
+            # Fill missing count with inferred value (never ask about count)
 
             # Step 2: Analyze existing structure
             structure_info = analyze_structure(parsed.start_grid)
@@ -375,11 +391,17 @@ class PurpleAgent(AgentExecutor):
 
             # Step 3: Plan via BAML LLM (with history!)
             history = self._history.get(ctx_id, [])
+
+            # Check feedback cache for similar past failures
+            ikey = self._instruction_key(parsed.instruction_text)
+            cached_correction = self._feedback_cache.get(ikey, "")
+
             steps = await self._planner.decompose(
                 parsed.instruction_text,
                 parsed.start_grid,
                 parsed.speaker,
                 structure_hint=structure_info.describe(),
+                correction_hint=cached_correction,
                 history=history,
             )
             if not steps:
@@ -490,7 +512,25 @@ class PurpleAgent(AgentExecutor):
             logger.warning("Fallback LLM failed: %s", exc)
             return "[BUILD]"
 
-    # ── History ──
+    # ── History & Learning ──
+
+    @staticmethod
+    def _instruction_key(instruction: str) -> str:
+        """Create a normalized key for instruction pattern matching.
+
+        Strips numbers and specific colors to match structurally similar
+        instructions across different rounds/lists.
+        """
+        lower = instruction.lower().strip()
+        # Remove numbers
+        key = re.sub(r'\b\d+\b', 'N', lower)
+        # Remove specific color names
+        for c in ("red", "blue", "green", "yellow", "purple", "orange",
+                   "white", "black", "brown", "pink", "grey", "gray", "cyan"):
+            key = re.sub(r'\b' + c + r'\b', 'COLOR', key)
+        # Collapse whitespace
+        key = re.sub(r'\s+', ' ', key).strip()
+        return key
 
     def _add_history(self, ctx_id: str, entry_type: str, content: str) -> None:
         if ctx_id not in self._history:
