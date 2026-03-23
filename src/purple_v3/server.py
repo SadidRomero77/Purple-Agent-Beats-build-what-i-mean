@@ -1,14 +1,15 @@
-"""A2A server for Purple Agent v3 — Build What I Mean competition.
+"""A2A server for Purple Agent v4 — Build What I Mean competition.
 
-BAML-powered pipeline:
-  parse → LLM ambiguity detect → analyze structure → LLM plan (BAML)
-  → deterministic fixes → execute → format → validate
+Pipeline: parse → regex ambiguity detect → EV-based ASK → patch instruction
+        → analyze structure → BAML plan → deterministic fixes → execute → format
 
-Key improvements over v2:
-1. LLM-based ambiguity detection (BAML) — always fires on real instructions
-2. History wired into planner — LLM learns across rounds
-3. GPT-4o-mini — cost-effective, good enough with deterministic pipeline
-4. Ask on ANY ambiguity — maximize information
+v4 improvements over v3:
+1. Precise regex ambiguity detection (replaces over-sensitive BAML LLM)
+2. EV-based ASK strategy (ask color AND count when EV-positive)
+3. Instruction patching BEFORE planner (not after)
+4. Smarter count inference from grid context
+5. Speaker modeling for cross-round adaptation
+6. Lower fallback temperature (0.05)
 """
 from __future__ import annotations
 
@@ -32,8 +33,9 @@ from purple_v3.instruction_parser import parse_green_message, ParsedInstruction
 from purple_v3.build_planner import BuildPlanner, BuildStep
 from purple_v3.spatial_executor import SpatialExecutor, ExecutionError
 from purple_v3.ambiguity_detector import (
-    detect_ambiguity_llm,
-    _infer_color_from_context,
+    detect_ambiguity,
+    infer_color_from_context,
+    infer_count_from_context,
     patch_instruction_with_color,
     patch_instruction_with_count,
 )
@@ -47,6 +49,7 @@ from purple_v3.plan_verifier import (
     auto_fix_t_shape_extend,
 )
 from purple_v3.plan_patcher import patch_chain_references
+from purple_v3.speaker_model import SpeakerModel
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +83,10 @@ _FALLBACK_SYSTEM_PROMPT = (
 
 def _make_agent_card(url: str) -> AgentCard:
     return AgentCard(
-        name="PurpleAgentV3_BWIM",
-        description="BAML-powered spatial reasoning agent for Build What I Mean.",
+        name="PurpleAgentV4_BWIM",
+        description="EV-optimized spatial reasoning agent for Build What I Mean.",
         url=url,
-        version="3.0.0",
+        version="4.0.0",
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],
         capabilities=AgentCapabilities(),
@@ -112,15 +115,14 @@ def _make_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpenA
 
 
 class PurpleAgent(AgentExecutor):
-    """Purple agent v3 with BAML-powered pipeline.
+    """Purple agent v4 — EV-optimized pipeline.
 
-    Competitive advantages:
-    1. LLM-based ambiguity detection (BAML) — never misses underspec
-    2. GPT-4o-mini with deterministic execution pipeline
-    3. History wired into planner for cross-round learning
-    4. 18 adaptive prompt enrichment rules + 9 worked examples
-    5. Self-verification pass with auto-corrections
-    6. Ask on ANY ambiguity detected
+    Key changes from v3:
+    1. Precise regex ambiguity detection (no BAML LLM call)
+    2. EV-based ASK for BOTH color and count
+    3. Instruction patching BEFORE planner
+    4. Speaker modeling for cross-round adaptation
+    5. Smarter count inference from grid context
     """
 
     _ANSWER_RE = re.compile(
@@ -150,22 +152,18 @@ class PurpleAgent(AgentExecutor):
         self._planner = BuildPlanner(self._client, self._model, self._config)
         # Per-context state
         self._history: dict[str, list[dict]] = {}
-        self._max_history = 8  # Balanced: enough context, no contamination
+        self._max_history = 8
         self._pending: dict[str, dict] = {}
         self._asked: set[str] = set()
         # ASK rate tracking: hard cap at 20%
         self._round_count: dict[str, int] = {}
         self._ask_count: dict[str, int] = {}
-        # Cross-round feedback cache: maps instruction pattern → correction
+        # Cross-round feedback cache
         self._feedback_cache: dict[str, str] = {}
+        # Speaker modeling
+        self._speaker_model = SpeakerModel()
 
     # ── Answer extraction ──
-
-    @classmethod
-    def _count_instruction_colors(cls, text: str) -> int:
-        """Count unique colors mentioned in instruction text."""
-        lower = text.lower()
-        return sum(1 for c in cls._COLOR_NAMES if re.search(r'\b' + c + r'\b', lower))
 
     @classmethod
     def _extract_answer_colors(cls, text: str) -> list[str]:
@@ -196,6 +194,45 @@ class PurpleAgent(AgentExecutor):
                 return val
         return None
 
+    # ── EV calculation ──
+
+    def _ev_should_ask(
+        self, ambiguity_type: str, instruction: str, grid: Grid, speaker: str
+    ) -> bool:
+        """Return True if EV(ask) > EV(guess) for this ambiguity type."""
+        # Hard cap: never exceed 20% ask rate
+        ctx_id = "default"  # Will be overridden by caller
+        rounds = max(sum(self._round_count.values()), 1)
+        asks = sum(self._ask_count.values())
+        if rounds >= 5 and asks / rounds > 0.20:
+            return False
+
+        # Speaker model: if speaker is reliable, don't ask
+        if speaker and not self._speaker_model.should_ask(speaker, ambiguity_type):
+            return False
+
+        ev_ask = -5 + 0.95 * 10  # = +4.5 (green answers correctly ~95%)
+
+        if ambiguity_type == "color":
+            if grid.blocks:
+                # P(correct guess) = max color frequency
+                color_counts: dict[str, int] = {}
+                for b in grid.blocks:
+                    color_counts[b.color] = color_counts.get(b.color, 0) + 1
+                total = sum(color_counts.values())
+                max_freq = max(color_counts.values()) / total
+                ev_guess = max_freq * 10 - (1 - max_freq) * 10
+            else:
+                ev_guess = -10  # No context → pure guess, likely wrong
+            return ev_ask > ev_guess
+
+        elif ambiguity_type == "count":
+            # Count guessing: ~45% chance of guessing correctly (default 3)
+            ev_guess = 0.45 * 10 - 0.55 * 10  # = -1.0
+            return ev_ask > ev_guess
+
+        return False
+
     # ── Main execute ──
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
@@ -215,32 +252,41 @@ class PurpleAgent(AgentExecutor):
 
         # Handle feedback / transition messages
         if parsed.is_feedback:
-            # Cache negative feedback for cross-round learning
             feedback_lower = parsed.feedback_text.lower()
-            if "incorrect" in feedback_lower or "-10" in feedback_lower:
-                # Get last instruction for this context and cache the failure
-                last_instructions = [
-                    e for e in self._history.get(ctx_id, [])
-                    if e["type"] == "instruction"
-                ]
-                if last_instructions:
+            # Update speaker model from feedback
+            is_correct = "correct" in feedback_lower and "incorrect" not in feedback_lower
+            last_instructions = [
+                e for e in self._history.get(ctx_id, []) if e["type"] == "instruction"
+            ]
+            if last_instructions:
+                self._speaker_model.record_feedback(
+                    parsed.speaker or self._last_speaker.get(ctx_id, ""),
+                    is_correct,
+                )
+                # Cache negative feedback
+                if not is_correct:
                     key = self._instruction_key(last_instructions[-1]["content"])
                     self._feedback_cache[key] = (
-                        f"PREVIOUS ATTEMPT FAILED on similar instruction. "
-                        f"Feedback was: {parsed.feedback_text[:200]}. "
+                        f"PREVIOUS ATTEMPT FAILED. "
+                        f"Feedback: {parsed.feedback_text[:200]}. "
                         f"Try a different approach."
                     )
-            # Add round separator to prevent history contamination
+
             self._add_history(ctx_id, "feedback", parsed.feedback_text)
             self._add_history(ctx_id, "separator", "--- NEW ROUND ---")
             self._pending.pop(ctx_id, None)
             self._asked.discard(ctx_id)
-            # Track round count for ASK cap
             self._round_count[ctx_id] = self._round_count.get(ctx_id, 0) + 1
             await event_queue.enqueue_event(
                 new_agent_text_message("[BUILD]", context_id=context.context_id)
             )
             return
+
+        # Track last speaker for feedback attribution
+        if not hasattr(self, '_last_speaker'):
+            self._last_speaker: dict[str, str] = {}
+        if parsed.speaker:
+            self._last_speaker[ctx_id] = parsed.speaker
 
         # ── Check if this is an answer to our question ──
         pending = self._pending.pop(ctx_id, None)
@@ -267,7 +313,7 @@ class PurpleAgent(AgentExecutor):
             self._asked.add(ctx_id)
             self._ask_count[ctx_id] = self._ask_count.get(ctx_id, 0) + 1
 
-        # Track round (non-feedback, non-answer messages)
+        # Track round
         if not parsed.is_feedback and not (pending and (answered_colors or answered_count is not None)):
             self._round_count[ctx_id] = self._round_count.get(ctx_id, 0) + 1
 
@@ -292,7 +338,6 @@ class PurpleAgent(AgentExecutor):
         orig_parsed = pending["parsed"]
         orig_input = pending.get("original_input", original_input)
 
-        # Disambiguate colors
         instruction_colors = {
             c for c in self._COLOR_NAMES if c in orig_parsed.instruction_text.lower()
         }
@@ -312,11 +357,7 @@ class PurpleAgent(AgentExecutor):
                 orig_parsed, ctx_id, orig_input, override_count=answered_count
             )
         elif ask_type == "count" and answered_count is not None:
-            patched = patch_instruction_with_count(
-                orig_parsed.instruction_text,
-                answered_count,
-                target_color=pending.get("uncounted_color", ""),
-            )
+            patched = patch_instruction_with_count(orig_parsed.instruction_text, answered_count)
             orig_parsed.instruction_text = patched
             orig_parsed._answered_count = answered_count
             response = await self._skills_pipeline(
@@ -327,18 +368,12 @@ class PurpleAgent(AgentExecutor):
             orig_parsed.instruction_text = patched
             response = await self._skills_pipeline(orig_parsed, ctx_id, orig_input)
 
-        # Re-verification guard: if pipeline produced a response, check
-        # that block count is reasonable vs start structure
+        # Re-verification guard
         if response and response.startswith("[BUILD]"):
             start_count = len(orig_parsed.start_grid.blocks)
             response_blocks = response.count(";")
-            # If response has way too many or too few blocks vs expected,
-            # fall back to direct LLM with the answer hint
             if response_blocks > 0 and (response_blocks > start_count + 15 or response_blocks < start_count):
-                logger.warning(
-                    "Re-verification: response has %d blocks vs %d start — suspicious, using fallback",
-                    response_blocks, start_count
-                )
+                logger.warning("Re-verification: %d blocks vs %d start — fallback", response_blocks, start_count)
                 response = None
 
         if response is None:
@@ -350,7 +385,7 @@ class PurpleAgent(AgentExecutor):
 
         return response
 
-    # ── Skills pipeline (with BAML + history) ──
+    # ── Skills pipeline ──
 
     async def _skills_pipeline(
         self,
@@ -359,45 +394,39 @@ class PurpleAgent(AgentExecutor):
         original_input: str = "",
         override_count: int | None = None,
     ) -> str | None:
-        """Full pipeline: LLM ambiguity → analyze → BAML plan → fix → execute → format."""
+        """Pipeline: regex ambiguity → EV ASK → patch → analyze → BAML plan → fix → execute."""
         try:
-            # Step 1: LLM-based ambiguity detection (BAML)
-            ambiguity = await detect_ambiguity_llm(
-                parsed.instruction_text,
-                parsed.start_grid,
-            )
-            logger.info("Ambiguity: color=%s count=%s reason=%s",
+            # Step 1: Precise regex ambiguity detection (NO LLM call)
+            ambiguity = detect_ambiguity(parsed.instruction_text, parsed.start_grid)
+            logger.info("Ambiguity: color=%s count=%s | %s",
                          ambiguity.has_missing_color, ambiguity.has_missing_count,
                          ambiguity.reasoning[:100])
 
-            inferred_count = override_count or ambiguity.inferred_count or 3
+            inferred_count = override_count or ambiguity.inferred_count
 
-            # ── ASK strategy (EV-based) ──
-            # NEVER ask about count: -5 penalty rarely justified, infer instead.
-            # Only ask about color when there's genuine ambiguity:
-            #   - Instruction has 0 colors AND grid has 2+ colors (can't guess)
-            #   - Instruction has 2+ colors AND colorless phrase (unclear which)
-            # Single-color instructions: just reuse that color (don't ask).
+            # Step 2: EV-based ASK decision
+            speaker = parsed.speaker or ""
 
-            # ── Hard ASK cap: never exceed 20% ask rate ──
-            rounds = self._round_count.get(ctx_id, 0)
-            asks = self._ask_count.get(ctx_id, 0)
-            ask_rate_exceeded = rounds >= 5 and asks / max(rounds, 1) > 0.20
+            # Compound ask (both missing, one -5 penalty for two answers)
+            if (
+                ambiguity.has_missing_color
+                and ambiguity.has_missing_count
+                and ctx_id not in self._asked
+                and self._ev_should_ask("color", parsed.instruction_text, parsed.start_grid, speaker)
+            ):
+                self._pending[ctx_id] = {
+                    "parsed": parsed,
+                    "original_input": original_input,
+                    "ask_type": "compound",
+                }
+                return f"[ASK];{ambiguity.suggested_color_question}"
 
-            should_ask_color = False
-            if ambiguity.has_missing_color and ctx_id not in self._asked and not ask_rate_exceeded:
-                instruction_colors = self._count_instruction_colors(parsed.instruction_text)
-                grid_colors = len(parsed.start_grid.unique_colors()) if parsed.start_grid.blocks else 0
-
-                if instruction_colors == 0 and grid_colors >= 2:
-                    # No color clue at all, grid has multiple — must ask
-                    should_ask_color = True
-                elif instruction_colors >= 2:
-                    # Multiple colors mentioned, unclear which applies — ask
-                    should_ask_color = True
-                # Single color in instruction or single grid color → infer, don't ask
-
-            if should_ask_color:
+            # Color-only ask
+            if (
+                ambiguity.has_missing_color
+                and ctx_id not in self._asked
+                and self._ev_should_ask("color", parsed.instruction_text, parsed.start_grid, speaker)
+            ):
                 self._pending[ctx_id] = {
                     "parsed": parsed,
                     "original_input": original_input,
@@ -405,34 +434,55 @@ class PurpleAgent(AgentExecutor):
                 }
                 return f"[ASK];{ambiguity.suggested_color_question}"
 
-            # Fill missing color with inferred value (never ask)
+            # Count-only ask
+            if (
+                ambiguity.has_missing_count
+                and not ambiguity.has_missing_color
+                and ctx_id not in self._asked
+                and override_count is None
+                and self._ev_should_ask("count", parsed.instruction_text, parsed.start_grid, speaker)
+            ):
+                self._pending[ctx_id] = {
+                    "parsed": parsed,
+                    "original_input": original_input,
+                    "ask_type": "count",
+                }
+                return f"[ASK];{ambiguity.suggested_count_question}"
+
+            # Step 3: Patch instruction BEFORE planner (not after!)
             if ambiguity.has_missing_color:
-                fill = ambiguity.inferred_color or _infer_color_from_context(
-                    parsed.instruction_text, parsed.start_grid
-                )
+                fill = ambiguity.inferred_color
                 parsed.instruction_text = patch_instruction_with_color(
                     parsed.instruction_text, fill
                 )
+                logger.info("Patched color: %s → '%s'", fill, parsed.instruction_text[:100])
 
-            # Fill missing count with inferred value (never ask about count)
+            if ambiguity.has_missing_count and override_count is None:
+                parsed.instruction_text = patch_instruction_with_count(
+                    parsed.instruction_text, inferred_count
+                )
+                logger.info("Patched count: %d → '%s'", inferred_count, parsed.instruction_text[:100])
 
-            # Step 2: Analyze existing structure
+            # Step 4: Analyze existing structure
             structure_info = analyze_structure(parsed.start_grid)
-            logger.info("Structure: %s", structure_info.describe()[:200])
 
-            # Step 3: Plan via BAML LLM (with history!)
+            # Step 5: Plan via BAML LLM (with history + speaker context)
             history = self._history.get(ctx_id, [])
-
-            # Check feedback cache for similar past failures
             ikey = self._instruction_key(parsed.instruction_text)
             cached_correction = self._feedback_cache.get(ikey, "")
+
+            # Add speaker context hint
+            speaker_hint = self._speaker_model.get_context_hint(speaker)
+            correction = cached_correction
+            if speaker_hint:
+                correction = f"{speaker_hint}\n{correction}" if correction else speaker_hint
 
             steps = await self._planner.decompose(
                 parsed.instruction_text,
                 parsed.start_grid,
                 parsed.speaker,
                 structure_hint=structure_info.describe(),
-                correction_hint=cached_correction,
+                correction_hint=correction,
                 history=history,
             )
             if not steps:
@@ -440,20 +490,18 @@ class PurpleAgent(AgentExecutor):
 
             logger.info("Planner: %d steps", len(steps))
 
-            # Step 3b: Chain reference patching
+            # Step 6: Deterministic post-processing
             steps = patch_chain_references(steps, parsed.start_grid)
-
-            # Step 3c: Auto-fixes (deterministic)
             steps = auto_fix_direction(parsed.instruction_text, steps)
             steps = auto_fix_each_end_caps(parsed.instruction_text, steps, parsed.start_grid)
             steps = auto_fix_t_shape_extend(parsed.instruction_text, steps, parsed.start_grid)
 
-            # Step 3d: Verify plan
+            # Step 6b: Verify plan
             verification = verify_plan(
                 parsed.instruction_text, steps, len(parsed.start_grid.blocks)
             )
             if verification.has_critical:
-                logger.info("Re-planning due to: %s", verification.correction_prompt()[:200])
+                logger.info("Re-planning: %s", verification.correction_prompt()[:200])
                 steps = await self._planner.decompose(
                     parsed.instruction_text,
                     parsed.start_grid,
@@ -469,25 +517,23 @@ class PurpleAgent(AgentExecutor):
                 steps = auto_fix_each_end_caps(parsed.instruction_text, steps, parsed.start_grid)
                 steps = auto_fix_t_shape_extend(parsed.instruction_text, steps, parsed.start_grid)
 
-            # Step 4: Resolve uncolored/uncounted
+            # Step 7: Resolve any remaining uncolored/uncounted
             _UNCOLORED = {"uncolored", "unknown", "unspecified", "?"}
             for s in steps:
                 if s.color.lower() in _UNCOLORED:
-                    s.color = ambiguity.inferred_color or "Purple"
+                    s.color = ambiguity.inferred_color
                 if isinstance(s.count, str) and s.count.lower() in (
                     "uncounted", "unknown", "unspecified", "?"
                 ):
                     s.count = inferred_count
 
-            # Step 5: Execute deterministically
+            # Step 8: Execute deterministically
             exec_grid = Grid.from_str(parsed.start_grid.to_str(), config=self._config)
             executor = SpatialExecutor(exec_grid)
             executor.execute_plan(steps)
 
-            # Step 6: Format response
+            # Step 9: Format + validate
             response = format_build_response(exec_grid)
-
-            # Step 7: Validate
             is_valid, errors = validate_build_response(response, self._config)
             if not is_valid:
                 logger.warning("Validation failed: %s", errors)
@@ -509,7 +555,6 @@ class PurpleAgent(AgentExecutor):
         try:
             messages: list[dict] = [{"role": "system", "content": _FALLBACK_SYSTEM_PROMPT}]
 
-            # Include history in fallback too!
             for entry in self._history.get(ctx_id, [])[-self._max_history * 3:]:
                 if entry["type"] == "instruction":
                     messages.append({"role": "user", "content": entry["content"]})
@@ -523,20 +568,16 @@ class PurpleAgent(AgentExecutor):
             completion = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
-                temperature=0.15,
+                temperature=0.05,  # Very low for fallback (was 0.15)
                 max_tokens=2048,
             )
             content = (completion.choices[0].message.content or "").strip()
 
             if content.startswith("[ASK]"):
-                logger.warning("Fallback LLM tried [ASK] → empty [BUILD]")
                 content = "[BUILD]"
             elif not content.startswith("[BUILD]"):
                 idx = content.find("[BUILD]")
-                if idx >= 0:
-                    content = content[idx:]
-                else:
-                    content = "[BUILD]"
+                content = content[idx:] if idx >= 0 else "[BUILD]"
 
             return content
         except Exception as exc:
@@ -547,21 +588,12 @@ class PurpleAgent(AgentExecutor):
 
     @staticmethod
     def _instruction_key(instruction: str) -> str:
-        """Create a normalized key for instruction pattern matching.
-
-        Strips numbers and specific colors to match structurally similar
-        instructions across different rounds/lists.
-        """
         lower = instruction.lower().strip()
-        # Remove numbers
         key = re.sub(r'\b\d+\b', 'N', lower)
-        # Remove specific color names
         for c in ("red", "blue", "green", "yellow", "purple", "orange",
                    "white", "black", "brown", "pink", "grey", "gray", "cyan"):
             key = re.sub(r'\b' + c + r'\b', 'COLOR', key)
-        # Collapse whitespace
-        key = re.sub(r'\s+', ' ', key).strip()
-        return key
+        return re.sub(r'\s+', ' ', key).strip()
 
     def _add_history(self, ctx_id: str, entry_type: str, content: str) -> None:
         if ctx_id not in self._history:
@@ -576,7 +608,7 @@ class PurpleAgent(AgentExecutor):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Purple Agent v3 — Build What I Mean (BAML)")
+    parser = argparse.ArgumentParser(description="Purple Agent v4 — Build What I Mean")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9018)
     parser.add_argument("--debug", action="store_true")
@@ -597,7 +629,7 @@ def main() -> None:
         task_store=InMemoryTaskStore(),
     )
 
-    logger.info("Starting Purple Agent v3 on %s:%d", args.host, args.port)
+    logger.info("Starting Purple Agent v4 on %s:%d", args.host, args.port)
     app = A2AStarletteApplication(agent_card=card, http_handler=handler)
     uvicorn.run(app.build(), host=args.host, port=args.port, timeout_keep_alive=300)
 

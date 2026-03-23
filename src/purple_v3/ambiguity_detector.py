@@ -1,17 +1,19 @@
-"""LLM-based ambiguity detection via BAML.
+"""Precise heuristic ambiguity detection for Build What I Mean.
 
-Replaces the broken regex heuristics from v2. Uses GPT-4o-mini to detect
-whether an instruction is missing a color or count for any block placement.
+Replaces the BAML LLM-based detector (v3) with calibrated regex heuristics.
+Key improvement: checks if color/count exists BETWEEN the placing verb and
+the block noun, not just anywhere in the clause. This eliminates false
+positives like "stack blocks behind the RED one" (red is a reference, not
+the placed block's color).
 
-Strategy: Ask whenever ANY ambiguity is detected (-5 cost but +10 if answer
-helps build correctly, vs -10 for wrong guess).
+Strategy: EV-based ASK decisions. Ask only when EV(ask) > EV(guess).
 """
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
-from typing import Set
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Tuple
 
 from .grid import Grid
 
@@ -22,6 +24,20 @@ KNOWN_COLORS: Set[str] = {
     "orange", "white", "black", "brown", "pink",
     "grey", "gray", "cyan",
 }
+
+_COLOR_PATTERN = '|'.join(KNOWN_COLORS)
+
+_WORD_TO_INT = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+_NUMBER_WORDS = '|'.join(_WORD_TO_INT.keys())
+
+# Verbs that imply placing blocks
+_PLACING_VERBS = r'(?:stack|place|build|add|put|extend|create|make)'
+# Nouns that represent block objects
+_BLOCK_NOUNS = r'(?:blocks?|stack|tower|row|line|column)'
 
 
 @dataclass
@@ -36,61 +52,127 @@ class AmbiguityInfo:
     reasoning: str = ""
 
 
-async def detect_ambiguity_llm(
-    instruction: str,
-    start_grid: Grid,
-) -> AmbiguityInfo:
-    """Detect ambiguity using BAML LLM call."""
-    try:
-        from .baml_client.baml_client import b
+def detect_ambiguity(instruction: str, grid: Grid) -> AmbiguityInfo:
+    """Detect missing color and/or count using precise regex heuristics.
 
-        # Gather context colors from the grid
-        context_colors = ", ".join(sorted(start_grid.unique_colors())) if start_grid.blocks else "none"
+    Key logic: checks if color/count exists BETWEEN the placing verb and
+    the block noun in each clause. "stack blocks behind the red one" has
+    no color between "stack" and "blocks" → missing color.
+    """
+    info = AmbiguityInfo()
+    lower = instruction.lower()
 
-        result = await b.DetectAmbiguity(
-            instruction=instruction,
-            start_structure=start_grid.to_str() or "(empty)",
-            context_colors=context_colors,
+    # Split into clauses
+    clauses = re.split(r'\.\s+|\bthen\b|\band\s+then\b|,\s*then\b|;\s*', lower)
+
+    for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+
+        # Find placing verb → block noun patterns
+        for m in re.finditer(
+            r'\b' + _PLACING_VERBS + r'\b(.*?)\b' + _BLOCK_NOUNS + r'\b',
+            clause,
+        ):
+            between = m.group(1)  # text BETWEEN verb and noun
+
+            # Check for color BETWEEN verb and noun
+            has_color_between = bool(re.search(
+                r'\b(' + _COLOR_PATTERN + r')\b', between
+            ))
+
+            # Check for count BETWEEN verb and noun
+            has_count_between = bool(re.search(
+                r'\b(\d+|' + _NUMBER_WORDS + r')\b', between
+            ))
+
+            # "a" or "an" before noun implies count=1 (not missing)
+            has_article = bool(re.search(r'\b(a|an)\b', between))
+
+            if not has_color_between:
+                # Verify this is actually a placing phrase (has a block noun)
+                if re.search(r'\b' + _BLOCK_NOUNS + r'\b', clause):
+                    info.has_missing_color = True
+
+            if not has_count_between and not has_article:
+                # "Build a stack" → "a" implies 1, not missing
+                # "Stack blocks" → genuinely missing count
+                # But "Build a yellow stack" → "a" is article for "stack", count IS missing
+                # Check: is there a "a/an" right before the noun (not between verb and color)?
+                full_match = m.group(0)
+                if not re.search(r'\ba\s+' + _BLOCK_NOUNS + r'\b', full_match):
+                    info.has_missing_count = True
+                elif re.search(r'\ba\s+(?:' + _COLOR_PATTERN + r'\s+)?' + r'(?:stack|tower)\b', full_match):
+                    # "Build a yellow stack" → count IS missing (how tall?)
+                    info.has_missing_count = True
+
+        # Also check for "Build a [color] stack/tower" without "of N"
+        stack_match = re.search(
+            r'\b(?:build|make|create)\s+a\s+(?:(?:' + _COLOR_PATTERN + r')\s+)?(?:stack|tower)\b',
+            clause,
         )
+        if stack_match:
+            # Check if count follows ("of 3", "of three")
+            after_match = clause[stack_match.end():]
+            has_count_after = bool(re.search(
+                r'^\s*(?:of\s+)?(\d+|' + _NUMBER_WORDS + r')\b', after_match
+            ))
+            if not has_count_after:
+                info.has_missing_count = True
 
-        info = AmbiguityInfo(
-            has_missing_color=result.has_missing_color,
-            has_missing_count=result.has_missing_count,
-            suggested_color_question=result.suggested_color_question or "What color should the unspecified blocks be?",
-            suggested_count_question=result.suggested_count_question or "How many blocks should be in the stack?",
-            inferred_color=result.inferred_color or _infer_color_from_context(instruction, start_grid),
-            inferred_count=result.inferred_count if result.inferred_count > 0 else 3,
-            reasoning=result.reasoning,
+    # Generate suggested questions
+    if info.has_missing_color and info.has_missing_count:
+        info.suggested_color_question = (
+            "What color should the unspecified blocks be, "
+            "and how many blocks should there be?"
         )
+        info.suggested_count_question = info.suggested_color_question
+    elif info.has_missing_color:
+        # Include context about what colors exist
+        instruction_colors = _extract_instruction_colors(lower)
+        if instruction_colors:
+            colors_str = ", ".join(c.capitalize() for c in sorted(instruction_colors))
+            info.suggested_color_question = (
+                f"What color should the unspecified blocks be? "
+                f"The instruction mentions {colors_str}."
+            )
+        else:
+            info.suggested_color_question = "What color should the unspecified blocks be?"
+    elif info.has_missing_count:
+        info.suggested_count_question = "How many blocks should be in the stack?"
 
-        logger.info("BAML ambiguity: color=%s count=%s reason=%s",
-                     info.has_missing_color, info.has_missing_count, info.reasoning[:100])
-        return info
+    # Infer defaults
+    info.inferred_color = infer_color_from_context(instruction, grid)
+    info.inferred_count = infer_count_from_context(instruction, grid)
+    info.reasoning = _build_reasoning(info, lower)
 
-    except Exception as exc:
-        logger.warning("BAML ambiguity detection failed, falling back to heuristic: %s", exc)
-        return _detect_ambiguity_heuristic(instruction, start_grid)
+    return info
 
 
-def _infer_color_from_context(instruction: str, grid: Grid) -> str:
+def _extract_instruction_colors(lower: str) -> Set[str]:
+    """Extract all color names mentioned in instruction text."""
+    colors = set()
+    for color in KNOWN_COLORS:
+        if re.search(r'\b' + color + r'\b', lower):
+            colors.add(color)
+    return colors
+
+
+def infer_color_from_context(instruction: str, grid: Grid) -> str:
     """Infer the most likely color for unspecified blocks.
 
-    Priority order:
-    1. If instruction has exactly one color → use that color
-    2. If instruction has multiple colors → use the LAST mentioned color
-       (the colorless phrase usually follows the last colored one)
-    3. If grid has blocks → use the most common color on the grid
-    4. If grid has blocks from instruction colors → use the one closest
-       to the colorless phrase position
-    5. Last resort → use "Red" (most common in stimulus data, never "Purple")
+    Priority:
+    1. Single color in instruction → use that
+    2. Multiple colors → use the LAST mentioned
+    3. Grid context → most common grid color
+    4. Last resort → "Red"
     """
     lower = instruction.lower()
 
-    # Find colors mentioned in instruction, preserving order of appearance
+    # Find colors in order of appearance
     instruction_colors = []
-    for m in re.finditer(
-        r'\b(' + '|'.join(KNOWN_COLORS) + r')\b', lower
-    ):
+    for m in re.finditer(r'\b(' + _COLOR_PATTERN + r')\b', lower):
         c = m.group(1).capitalize()
         if c not in instruction_colors:
             instruction_colors.append(c)
@@ -99,143 +181,123 @@ def _infer_color_from_context(instruction: str, grid: Grid) -> str:
         return instruction_colors[0]
 
     if len(instruction_colors) > 1:
-        # Use the last mentioned color — colorless phrases typically follow
-        # the last colored clause and refer to the same context
         return instruction_colors[-1]
 
-    # No colors in instruction — use grid context
     if grid.blocks:
         return grid.most_common_color()
 
-    # Absolute last resort — "Red" is the most common color in the game,
-    # never default to "Purple" which is rarely the intended answer
     return "Red"
 
 
-def _detect_ambiguity_heuristic(instruction: str, grid: Grid) -> AmbiguityInfo:
-    """Fallback heuristic detection when BAML is unavailable."""
-    info = AmbiguityInfo()
+def infer_count_from_context(instruction: str, grid: Grid) -> int:
+    """Infer missing count from grid context.
+
+    Priority:
+    1. If instruction references a specific color stack, match its height
+    2. If grid has stacks, use the most common stack height
+    3. Default to 3
+    """
     lower = instruction.lower()
 
-    # Find all color mentions
-    instruction_colors = set()
+    # Check if instruction references a specific stack color
     for color in KNOWN_COLORS:
         if re.search(r'\b' + color + r'\b', lower):
-            instruction_colors.add(color)
+            color_blocks = grid.find_color(color.capitalize())
+            if color_blocks:
+                # Find the tallest stack of this color
+                positions: Dict[Tuple[int, int], int] = {}
+                for b in color_blocks:
+                    key = (b.x, b.z)
+                    positions[key] = positions.get(key, 0) + 1
+                if positions:
+                    return max(positions.values())
 
-    # Check for block-placing phrases without a color
-    # Patterns allow optional numbers/words between verb and noun
-    _NUM_WORDS = r'(?:\d+\s+|a\s+|an\s+|the\s+|some\s+|one\s+|two\s+|three\s+|four\s+|five\s+|six\s+|seven\s+|eight\s+|nine\s+|ten\s+)*'
-    placing_patterns = [
-        r'\bstack\s+' + _NUM_WORDS + r'blocks?\b',
-        r'\bbuild\s+(?:a\s+)?' + _NUM_WORDS + r'(?:stack|tower)\b',
-        r'\bplace\s+' + _NUM_WORDS + r'(?:blocks?|horizontal\s+row)\b',
-        r'\badd\s+' + _NUM_WORDS + r'blocks?\b',
-        r'\bput\s+' + _NUM_WORDS + r'blocks?\b',
-    ]
+    # Use most common stack height on grid
+    if grid.blocks:
+        heights: Dict[Tuple[int, int], int] = {}
+        for b in grid.blocks:
+            key = (b.x, b.z)
+            heights[key] = heights.get(key, 0) + 1
+        if heights:
+            # Return most common height
+            height_counts: Dict[int, int] = {}
+            for h in heights.values():
+                height_counts[h] = height_counts.get(h, 0) + 1
+            return max(height_counts, key=height_counts.get)  # type: ignore
 
-    # Split by clauses
-    clauses = re.split(r'\.\s*|\bthen\b|\band\s+then\b', lower)
+    return 3
 
-    for clause in clauses:
-        has_placing = any(re.search(p, clause) for p in placing_patterns)
-        if not has_placing:
-            continue
 
-        has_color = any(re.search(r'\b' + c + r'\b', clause) for c in KNOWN_COLORS)
-        if not has_color:
-            info.has_missing_color = True
-            info.suggested_color_question = "What color should the unspecified blocks be?"
-
-    # Check for missing count
-    count_patterns = [
-        r'\bstack\s+(?:' + '|'.join(KNOWN_COLORS) + r')?\s*blocks?\b',
-        r'\bbuild\s+(?:a\s+)?(?:' + '|'.join(KNOWN_COLORS) + r')?\s*(?:stack|tower)\b',
-    ]
-
-    for clause in clauses:
-        for pattern in count_patterns:
-            m = re.search(pattern, clause)
-            if not m:
-                continue
-            # Check for number in surrounding context
-            context = clause
-            has_number = bool(re.search(r'\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\b', context))
-            if not has_number:
-                info.has_missing_count = True
-                info.suggested_count_question = "How many blocks should be in the stack?"
-
-    info.inferred_color = _infer_color_from_context(instruction, grid)
-    info.inferred_count = 3
-
-    return info
+def _build_reasoning(info: AmbiguityInfo, lower: str) -> str:
+    """Build a human-readable reasoning string."""
+    parts = []
+    if info.has_missing_color:
+        parts.append("Missing color: placing verb found without color between verb and noun")
+    if info.has_missing_count:
+        parts.append("Missing count: no number/word-number between verb and noun")
+    if not parts:
+        parts.append("Fully specified: all placing phrases have color and count")
+    return "; ".join(parts)
 
 
 def patch_instruction_with_color(instruction: str, color: str) -> str:
-    """Patch colorless block-placing phrases with the given color."""
-    _NUM_WORDS_PAT = r'(?:\d+\s+|a\s+|an\s+|the\s+|some\s+|one\s+|two\s+|three\s+|four\s+|five\s+|six\s+|seven\s+|eight\s+|nine\s+|ten\s+)*'
+    """Insert color into colorless block-placing phrases."""
 
     def _insert_color(match):
         pre = match.group(0)
+        # Don't double-insert
         for c in KNOWN_COLORS:
             if c in pre.lower():
                 return pre
-        noun_match = re.search(r'\b(blocks?|stack|tower|row)\b', pre, re.IGNORECASE)
+        # Find noun and insert color before it
+        noun_match = re.search(r'\b(' + _BLOCK_NOUNS + r')\b', pre, re.IGNORECASE)
         if noun_match:
             idx = noun_match.start()
             return pre[:idx] + color.lower() + " " + pre[idx:]
         return pre
 
+    _NUM = r'(?:\d+\s+|a\s+|an\s+|the\s+|some\s+|one\s+|two\s+|three\s+|four\s+|five\s+|six\s+|seven\s+|eight\s+|nine\s+|ten\s+)*'
     patterns = [
-        r'\b(stack|place|build|put|add)\s+' + _NUM_WORDS_PAT + r'(?:blocks?|stack|tower)',
-        r'\b(extend|continue)\s+(?:the\s+)?(?:row|line)',
+        r'\b' + _PLACING_VERBS + r'\s+' + _NUM + r'(?:' + _BLOCK_NOUNS + r')',
+        r'\b(?:extend|continue)\s+(?:the\s+)?(?:row|line)',
     ]
 
     result = instruction
     for pattern in patterns:
         result = re.sub(pattern, _insert_color, result, flags=re.IGNORECASE)
-
     return result
 
 
 def patch_instruction_with_count(
     instruction: str, count: int, target_color: str = ""
 ) -> str:
-    """Patch missing count into the instruction."""
+    """Insert count into countless block-placing phrases."""
     lower = instruction.lower()
 
-    # Patterns that indicate a missing count, with their replacements
-    _COLOR_PAT = r'(?:(?:' + '|'.join(KNOWN_COLORS) + r')\s+)?'
-    patterns = [
-        (r'\bstack\s+' + _COLOR_PAT + r'(blocks)\b', lambda m: m.group(0).replace(m.group(1) if m.lastindex else 'blocks', f'{count} blocks')),
-        (r'\bbuild\s+a\s+' + _COLOR_PAT + r'(stack|tower)\b', lambda m: m.group(0).replace(m.group(0).split()[-1], f'stack of {count}')),
-        (r'\bplace\s+(blocks)\b', lambda m: f'place {count} blocks'),
-        (r'\badd\s+(blocks)\b', lambda m: f'add {count} blocks'),
-    ]
+    # Already has a number → don't patch
+    if re.search(r'\b(\d+|' + _NUMBER_WORDS + r')\s+(?:' + _BLOCK_NOUNS + r')\b', lower):
+        return instruction
 
-    # Simpler approach: insert count before "stack/tower" when no number present
-    # Check if there's already a number near "stack"/"tower"
-    if not re.search(r'\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:blocks?|stack|tower)\b', lower):
-        # Insert "of {count}" after "stack" or "tower" when it's a noun
-        result = re.sub(
-            r'\b((?:a|the)\s+(?:\w+\s+)?(?:stack|tower))\b',
-            lambda m: m.group(0) + f' of {count}',
-            instruction,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-        if result != instruction:
-            return result
+    # "Build a [color] stack/tower" → "Build a [color] stack of N"
+    result = re.sub(
+        r'\b((?:a|the)\s+(?:\w+\s+)?(?:stack|tower))\b',
+        lambda m: m.group(0) + f' of {count}',
+        instruction,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if result != instruction:
+        return result
 
-        # Insert count before "blocks"
-        result = re.sub(
-            r'\b(stack|place|build|add)\s+(blocks)\b',
-            lambda m: f'{m.group(1)} {count} blocks',
-            instruction,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-        if result != instruction:
-            return result
+    # "stack [color] blocks" → "stack N [color] blocks"
+    result = re.sub(
+        r'\b(stack|place|build|add)\s+((?:' + _COLOR_PATTERN + r'\s+)?blocks)\b',
+        lambda m: f'{m.group(1)} {count} {m.group(2)}',
+        instruction,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if result != instruction:
+        return result
 
     return instruction
