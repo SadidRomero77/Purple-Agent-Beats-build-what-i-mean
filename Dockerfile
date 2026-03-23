@@ -9,7 +9,7 @@ COPY --chown=agent:agent src src
 
 RUN uv sync --no-dev
 
-ENTRYPOINT ["uv", "run", "src/purple_v3/server.py"]
+ENTRYPOINT ["uv", "run", "src/server.py"]
 CMD ["--host", "0.0.0.0", "--port", "9018"]
 
 EXPOSE 9018
