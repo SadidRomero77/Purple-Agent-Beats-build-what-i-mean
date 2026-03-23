@@ -1,5 +1,5 @@
 function DetectAmbiguity(instruction: string, start_structure: string, context_colors: string) -> AmbiguityResult {
-  client GPT4o
+  client GPT4oMini
 
   prompt #"
     You are an ambiguity detector for a block-building game on a 9x9 grid.

@@ -1,5 +1,5 @@
 function DecomposeBuildInstruction(instruction: string, start_structure: string, structure_analysis: string, history_context: string, enrichment: string, correction_hint: string) -> BuildPlan {
-  client GPT4o
+  client GPT4oMini
 
   prompt #"
     You are a precise block-building planner on a 9x9 grid.

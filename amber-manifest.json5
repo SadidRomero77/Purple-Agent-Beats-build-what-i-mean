@@ -13,7 +13,7 @@
     ],
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",
-      AGENT_MODEL: "openai/gpt-4o",
+      AGENT_MODEL: "openai/gpt-4o-mini",
       AGENT_TEMPERATURE: "0.0",
       AGENT_DEBUG: "true"
     },

@@ -5,7 +5,7 @@ env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 [[participants]]
 agentbeats_id = ""  # Fill with your purple agent ID after registration
 name = "rita"
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}", AGENT_MODEL = "openai/gpt-4o" }
+env = { OPENAI_API_KEY = "${OPENAI_API_KEY}", AGENT_MODEL = "openai/gpt-4o-mini" }
 
 [config]
 list1_path = "data/List1_FINAL_stimuli_list.csv"

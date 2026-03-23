@@ -150,9 +150,12 @@ class PurpleAgent(AgentExecutor):
         self._planner = BuildPlanner(self._client, self._model, self._config)
         # Per-context state
         self._history: dict[str, list[dict]] = {}
-        self._max_history = 10  # Increased from 5 for more context
+        self._max_history = 8  # Balanced: enough context, no contamination
         self._pending: dict[str, dict] = {}
         self._asked: set[str] = set()
+        # ASK rate tracking: hard cap at 20%
+        self._round_count: dict[str, int] = {}
+        self._ask_count: dict[str, int] = {}
         # Cross-round feedback cache: maps instruction pattern → correction
         self._feedback_cache: dict[str, str] = {}
 
@@ -227,9 +230,13 @@ class PurpleAgent(AgentExecutor):
                         f"Feedback was: {parsed.feedback_text[:200]}. "
                         f"Try a different approach."
                     )
+            # Add round separator to prevent history contamination
             self._add_history(ctx_id, "feedback", parsed.feedback_text)
+            self._add_history(ctx_id, "separator", "--- NEW ROUND ---")
             self._pending.pop(ctx_id, None)
             self._asked.discard(ctx_id)
+            # Track round count for ASK cap
+            self._round_count[ctx_id] = self._round_count.get(ctx_id, 0) + 1
             await event_queue.enqueue_event(
                 new_agent_text_message("[BUILD]", context_id=context.context_id)
             )
@@ -258,6 +265,11 @@ class PurpleAgent(AgentExecutor):
             response = await self._direct_llm_call(user_input, ctx_id)
         elif response.startswith("[ASK]"):
             self._asked.add(ctx_id)
+            self._ask_count[ctx_id] = self._ask_count.get(ctx_id, 0) + 1
+
+        # Track round (non-feedback, non-answer messages)
+        if not parsed.is_feedback and not (pending and (answered_colors or answered_count is not None)):
+            self._round_count[ctx_id] = self._round_count.get(ctx_id, 0) + 1
 
         self._add_history(ctx_id, "instruction", parsed.instruction_text)
         self._add_history(ctx_id, "response", response)
@@ -288,7 +300,7 @@ class PurpleAgent(AgentExecutor):
             new_colors = [c for c in answered_colors if c.lower() not in instruction_colors]
             color_str = new_colors[0] if new_colors else answered_colors[-1]
         else:
-            color_str = answered_colors[0] if answered_colors else "Purple"
+            color_str = answered_colors[0] if answered_colors else "Red"
 
         if ask_type == "compound":
             patched = patch_instruction_with_color(orig_parsed.instruction_text, color_str)
@@ -314,6 +326,20 @@ class PurpleAgent(AgentExecutor):
             patched = patch_instruction_with_color(orig_parsed.instruction_text, color_str)
             orig_parsed.instruction_text = patched
             response = await self._skills_pipeline(orig_parsed, ctx_id, orig_input)
+
+        # Re-verification guard: if pipeline produced a response, check
+        # that block count is reasonable vs start structure
+        if response and response.startswith("[BUILD]"):
+            start_count = len(orig_parsed.start_grid.blocks)
+            response_blocks = response.count(";")
+            # If response has way too many or too few blocks vs expected,
+            # fall back to direct LLM with the answer hint
+            if response_blocks > 0 and (response_blocks > start_count + 15 or response_blocks < start_count):
+                logger.warning(
+                    "Re-verification: response has %d blocks vs %d start — suspicious, using fallback",
+                    response_blocks, start_count
+                )
+                response = None
 
         if response is None:
             hint = f"\n\nThe answer is: {color_str}"
@@ -353,8 +379,13 @@ class PurpleAgent(AgentExecutor):
             #   - Instruction has 2+ colors AND colorless phrase (unclear which)
             # Single-color instructions: just reuse that color (don't ask).
 
+            # ── Hard ASK cap: never exceed 20% ask rate ──
+            rounds = self._round_count.get(ctx_id, 0)
+            asks = self._ask_count.get(ctx_id, 0)
+            ask_rate_exceeded = rounds >= 5 and asks / max(rounds, 1) > 0.20
+
             should_ask_color = False
-            if ambiguity.has_missing_color and ctx_id not in self._asked:
+            if ambiguity.has_missing_color and ctx_id not in self._asked and not ask_rate_exceeded:
                 instruction_colors = self._count_instruction_colors(parsed.instruction_text)
                 grid_colors = len(parsed.start_grid.unique_colors()) if parsed.start_grid.blocks else 0
 
