@@ -198,9 +198,15 @@ class PurpleAgent(AgentExecutor):
 
         # Handle feedback / transition messages
         if parsed.is_feedback:
-            self._add_history(ctx_id, "feedback", parsed.feedback_text)
-            self._pending.pop(ctx_id, None)
-            self._asked.discard(ctx_id)
+            # On new task (new seed), clear ALL state for a fresh start
+            if "new task is starting" in parsed.feedback_text.lower():
+                self._history.pop(ctx_id, None)
+                self._pending.pop(ctx_id, None)
+                self._asked.discard(ctx_id)
+            else:
+                self._add_history(ctx_id, "feedback", parsed.feedback_text)
+                self._pending.pop(ctx_id, None)
+                self._asked.discard(ctx_id)
             await event_queue.enqueue_event(
                 new_agent_text_message("[BUILD]", context_id=context.context_id)
             )
