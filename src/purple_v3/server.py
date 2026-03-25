@@ -214,22 +214,16 @@ class PurpleAgent(AgentExecutor):
         ev_ask = -5 + 0.95 * 10  # = +4.5 (green answers correctly ~95%)
 
         if ambiguity_type == "color":
-            if grid.blocks:
-                # P(correct guess) = max color frequency
-                color_counts: dict[str, int] = {}
-                for b in grid.blocks:
-                    color_counts[b.color] = color_counts.get(b.color, 0) + 1
-                total = sum(color_counts.values())
-                max_freq = max(color_counts.values()) / total
-                ev_guess = max_freq * 10 - (1 - max_freq) * 10
-            else:
-                ev_guess = -10  # No context → pure guess, likely wrong
-            return ev_ask > ev_guess
+            # Empirical: color inference accuracy ~54% even with single color context.
+            # EV(guess) = 0.54*10 - 0.46*10 = +0.8 < EV(ask)=+4.5 → always ask.
+            ev_guess = 0.54 * 10 - 0.46 * 10  # = +0.8
+            return ev_ask > ev_guess  # Always True
 
         elif ambiguity_type == "count":
-            # Count guessing: ~45% chance of guessing correctly (default 3)
-            ev_guess = 0.45 * 10 - 0.55 * 10  # = -1.0
-            return ev_ask > ev_guess
+            # Empirical: count inference accuracy ~64.6%.
+            # EV(guess) = 0.646*10 - 0.354*10 = +2.92 < EV(ask)=+4.5 → always ask.
+            ev_guess = 0.646 * 10 - 0.354 * 10  # = +2.92
+            return ev_ask > ev_guess  # Always True
 
         return False
 

@@ -289,9 +289,10 @@ def auto_fix_t_shape_extend(
     Bug A: direction="on_top" or wrong axis (stacks vertically instead of extending)
     Bug B: action="stack" instead of "extend_row" at stem tip
     Fix: Analyze T-shape, compute correct direction away from junction.
+    Uses longer_base to identify which part to extend.
     """
     lower = instruction.lower()
-    if not re.search(r'\b(t[\s-]?shape|stem)\b', lower):
+    if not re.search(r'\b(t[\s-]?shape|stem|crossbar)\b', lower):
         return steps
 
     info = analyze_structure(start_grid)
@@ -302,8 +303,9 @@ def auto_fix_t_shape_extend(
     junction = t["junction"]
     stem_tip = t["stem_tip"]
     stem_axis = t["stem_axis"]
+    grid_step = start_grid.config.step  # 100
 
-    # Determine correct direction away from junction
+    # Determine correct direction away from junction (along stem axis, away from junction)
     if stem_axis == "z":
         if stem_tip[1] < junction[1]:
             correct_dir = "behind"
@@ -315,35 +317,51 @@ def auto_fix_t_shape_extend(
         else:
             correct_dir = "right"
 
+    offset = DIRECTION_OFFSETS.get(correct_dir, (0, 0))
+    expected_start = (stem_tip[0] + offset[0], stem_tip[1] + offset[1])
+
+    # Bug A fix: extend_row with wrong direction or wrong start position
     for step in steps:
         if step.action == "extend_row":
             if step.direction in ("on_top", "up", "down"):
                 logger.info("Auto-fix T-shape: direction '%s' -> '%s'", step.direction, correct_dir)
                 step.direction = correct_dir
-            # Fix start position to be beyond stem tip
-            offset = DIRECTION_OFFSETS.get(correct_dir, (0, 0))
-            expected_start_x = stem_tip[0] + offset[0]
-            expected_start_z = stem_tip[1] + offset[1]
-            if step.position.get("x") != expected_start_x or step.position.get("z") != expected_start_z:
-                logger.info(
-                    "Auto-fix T-shape start: (%s,%s) -> (%d,%d)",
-                    step.position.get("x"), step.position.get("z"),
-                    expected_start_x, expected_start_z,
-                )
-                step.position["x"] = expected_start_x
-                step.position["z"] = expected_start_z
+            # Fix start position to be one step past stem tip
+            sx = step.position.get("x", None)
+            sz = step.position.get("z", None)
+            if sx is not None and sz is not None:
+                at_stem_tip = (abs(sx - stem_tip[0]) <= grid_step and abs(sz - stem_tip[1]) <= grid_step)
+                at_expected = (sx == expected_start[0] and sz == expected_start[1])
+                if at_stem_tip and not at_expected:
+                    logger.info(
+                        "Auto-fix T-shape start: (%s,%s) -> (%d,%d)",
+                        sx, sz, expected_start[0], expected_start[1],
+                    )
+                    step.position["x"] = expected_start[0]
+                    step.position["z"] = expected_start[1]
 
-        elif step.action == "stack" and re.search(r'\bextend\b', lower):
-            # Bug B: should be extend_row, not stack
+    # Bug B fix: no extend_row found — LLM produced stack/place at stem tip instead
+    extend_step = next((s for s in steps if s.action == "extend_row"), None)
+    if extend_step is None and re.search(r'\bextend\b', lower):
+        for step in steps:
+            if step.action not in ("stack", "place", "place_relative"):
+                continue
             sx = step.position.get("x", 0)
             sz = step.position.get("z", 0)
-            if (sx, sz) == stem_tip or (abs(sx - stem_tip[0]) <= 100 and abs(sz - stem_tip[1]) <= 100):
-                logger.info("Auto-fix T-shape: converting stack to extend_row at stem tip")
+            # at_base: within one grid_step of stem_tip
+            at_base = (abs(sx - stem_tip[0]) <= grid_step and abs(sz - stem_tip[1]) <= grid_step)
+            # one_past: exactly one step past stem tip in correct direction
+            one_past = (sx == expected_start[0] and sz == expected_start[1])
+            if at_base or one_past:
+                logger.info(
+                    "Auto-fix T-shape Error B: converting %s to extend_row at (%d,%d)",
+                    step.action, sx, sz,
+                )
                 step.action = "extend_row"
                 step.direction = correct_dir
-                offset = DIRECTION_OFFSETS.get(correct_dir, (0, 0))
-                step.position["x"] = stem_tip[0] + offset[0]
-                step.position["z"] = stem_tip[1] + offset[1]
+                step.position["x"] = expected_start[0]
+                step.position["z"] = expected_start[1]
+                break
 
     # Fix cap positions at crossbar ends (if "each end" mentioned)
     if re.search(r'\b(each|both)\s+(end|side)s?\b', lower):
@@ -352,7 +370,6 @@ def auto_fix_t_shape_extend(
         cap_steps = [s for s in steps if s.action in ("stack", "place") and s != steps[0]]
 
         if len(cap_steps) >= 2:
-            # Ensure caps are at the actual crossbar endpoints
             cap_steps[0].position["x"] = crossbar_start[0]
             cap_steps[0].position["z"] = crossbar_start[1]
             cap_steps[1].position["x"] = crossbar_end[0]

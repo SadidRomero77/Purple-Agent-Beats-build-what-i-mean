@@ -160,42 +160,62 @@ class SpatialExecutor:
     def _exec_extend_row(self, step: BuildStep) -> None:
         """Place N blocks in a line from start position in a direction.
 
-        Fixed: removed auto-advance that caused off-by-one errors.
-        The planner is responsible for correct start positions.
-        We only skip positions that already have a block at ground level
-        to avoid duplicates, but we don't shift the start.
+        Same-color skip-forward rule (two cases):
+        - Case 1: relative_to in position → ALWAYS advance start one step
+        - Case 2: absolute coords → advance start only if same-color block exists at start
+        Then place count blocks contiguously from the (possibly advanced) start.
         """
-        x, z = self._resolve_position(step)
+        pos = step.position
         color = self._resolve_color(step.color)
         count = self._resolve_count(step.count, step)
         direction = step.direction
 
         offset = DIRECTION_OFFSETS.get(direction, (100, 0))
+        dx, dz = offset
 
-        placed = 0
-        for i in range(count + 4):  # allow extra iterations to skip occupied cells
-            bx = x + offset[0] * i
-            bz = z + offset[1] * i
+        # Resolve base start position
+        if "x" in pos and "z" in pos:
+            start_x, start_z = int(pos["x"]), int(pos["z"])
+        elif step.reference:
+            ref = self._resolve_reference(step.reference)
+            if ref is None:
+                raise ExecutionError(f"Cannot resolve reference: {step.reference}")
+            start_x, start_z = ref
+        else:
+            raise ExecutionError(f"Cannot resolve position for extend_row: {step}")
+
+        # Same-color skip-forward rule
+        if "relative_to" in pos:
+            # Case 1: relative reference → ALWAYS advance one step past reference
+            logger.info("extend_row: relative_to reference, advancing start one step %s", direction)
+            start_x += dx
+            start_z += dz
+        else:
+            # Case 2: absolute coords → advance only if same-color block at start position
+            existing = self.grid.blocks_at(start_x, start_z)
+            if existing and any(b.color == color for b in existing):
+                logger.info(
+                    "extend_row: start (%d,%d) already has %s, advancing one step %s",
+                    start_x, start_z, color, direction,
+                )
+                start_x += dx
+                start_z += dz
+
+        # Place count blocks contiguously from start
+        last_x, last_z = start_x, start_z
+        for i in range(count):
+            bx = start_x + dx * i
+            bz = start_z + dz * i
             # Validate bounds
             if bx < self.grid.config.x_min or bx > self.grid.config.x_max:
                 break
             if bz < self.grid.config.z_min or bz > self.grid.config.z_max:
                 break
-            # Skip positions that already have this color at ground level
-            existing = self.grid.blocks_at(bx, bz)
-            if existing and any(b.color == color and b.y == self.grid.config.y_ground for b in existing):
-                continue
             self.grid.add_block(color, bx, bz)
-            placed += 1
-            if placed >= count:
-                break
+            last_x, last_z = bx, bz
 
-        # Track last placed position
-        if placed > 0:
-            last_x = bx
-            last_z = bz
-            self._last_position_by_color[color] = (last_x, last_z)
-        logger.debug("Extended row of %d %s from (%d,%d) %s (placed %d)", count, color, x, z, direction, placed)
+        self._last_position_by_color[color] = (last_x, last_z)
+        logger.debug("Extended row of %d %s from (%d,%d) %s", count, color, start_x, start_z, direction)
 
     def _exec_place_at_corners(self, step: BuildStep) -> None:
         """Place blocks at grid corners."""

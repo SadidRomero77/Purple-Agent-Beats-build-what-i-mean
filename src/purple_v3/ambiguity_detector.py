@@ -122,6 +122,8 @@ def detect_ambiguity(instruction: str, grid: Grid) -> AmbiguityInfo:
                 info.has_missing_count = True
 
     # Generate suggested questions
+    instruction_colors = _extract_instruction_colors(lower)
+
     if info.has_missing_color and info.has_missing_count:
         info.suggested_color_question = (
             "What color should the unspecified blocks be, "
@@ -129,8 +131,6 @@ def detect_ambiguity(instruction: str, grid: Grid) -> AmbiguityInfo:
         )
         info.suggested_count_question = info.suggested_color_question
     elif info.has_missing_color:
-        # Include context about what colors exist
-        instruction_colors = _extract_instruction_colors(lower)
         if instruction_colors:
             colors_str = ", ".join(c.capitalize() for c in sorted(instruction_colors))
             info.suggested_color_question = (
@@ -140,7 +140,14 @@ def detect_ambiguity(instruction: str, grid: Grid) -> AmbiguityInfo:
         else:
             info.suggested_color_question = "What color should the unspecified blocks be?"
     elif info.has_missing_count:
-        info.suggested_count_question = "How many blocks should be in the stack?"
+        # Color-specific count question so green agent can identify the correct stack
+        if instruction_colors:
+            color_lower = next(iter(instruction_colors))
+            info.suggested_count_question = (
+                f"How many {color_lower} blocks should be in the {color_lower} stack?"
+            )
+        else:
+            info.suggested_count_question = "How many blocks should be in the stack?"
 
     # Infer defaults
     info.inferred_color = infer_color_from_context(instruction, grid)

@@ -258,7 +258,8 @@ COORDINATE SYSTEM:
 - Grid is x-z plane. Origin (0,0) is center ("middle square").
 - X: left (-x) to right (+x). Valid: [-400,-300,-200,-100,0,100,200,300,400]
 - Z: back (-z) to front (+z). Valid: [-400,-300,-200,-100,0,100,200,300,400]
-- Y: vertical. Ground=50. Each block +100. Valid: [50,150,250,350,450]
+- Y: vertical. Ground=50. Each block +100. Y is AUTO-MANAGED — never include y in position.
+- Grid step = 100 units between adjacent squares.
 
 DIRECTIONS:
 - "right" = +x | "left" = -x | "in front of" = +z | "behind" = -z | "on top" = +y
@@ -269,14 +270,84 @@ STEP TYPES:
 1. "stack" - N blocks vertically at (x,z). {"action":"stack","color":"Red","count":3,"position":{"x":0,"z":0}}
 2. "place" - Single block. {"action":"place","color":"Blue","count":1,"position":{"x":100,"z":200}}
 3. "place_relative" - Relative to reference. {"action":"place_relative","color":"Green","count":1,"reference":"Red_at_0_0","direction":"right"}
-4. "extend_row" - N blocks in line. {"action":"extend_row","color":"Yellow","count":3,"position":{"x":0,"z":0},"direction":"right"}
+4. "extend_row" - N blocks in line from start. {"action":"extend_row","color":"Yellow","count":3,"position":{"x":0,"z":0},"direction":"right"}
 5. "place_at_corners" - All corners. {"action":"place_at_corners","color":"Red","count":4}
 
-RULES:
+CRITICAL RULES:
 - Only x,z in position. Y auto-managed.
 - "Uncolored" if no color specified. "Uncounted" if no count.
-- Chain refs: use NEW position from previous step.
-- Row "from middle going right" starts AT x=0.
+- For extend_row: if start position already has a block of the SAME color, executor auto-advances — give the actual start (do NOT pre-advance yourself).
+- "each end" after extension: use the NEW endpoints after the row is extended, not the old ones.
+- T/L-shape extensions: use extend_row along the stem/arm axis, NEVER stack on top.
+- Chain refs: "the green one" = last placed green block position.
+- "in front of X" = (X.x, X.z + 100). "behind X" = (X.x, X.z - 100).
+
+WORKED EXAMPLES:
+
+Example 1 — Chain reference (place relative to previous step):
+Instruction: "Place a blue block to the right of the red one, then a green block in front of the blue one"
+{"steps": [
+  {"action":"place","color":"Red","count":1,"position":{"x":0,"z":0}},
+  {"action":"place_relative","color":"Blue","count":1,"reference":"Red_last","direction":"right"},
+  {"action":"place_relative","color":"Green","count":1,"reference":"Blue_last","direction":"front"}
+]}
+
+Example 2 — Extend row then stack behind rightmost:
+Instruction: "Extend the red row right by 3, then stack 2 blue blocks behind the rightmost red"
+Existing: Red at x=-100,0,100 z=0
+{"steps": [
+  {"action":"extend_row","color":"Red","count":3,"position":{"x":200,"z":0},"direction":"right"},
+  {"action":"stack","color":"Blue","count":2,"position":{"x":400,"z":-100}}
+]}
+
+Example 3 — Block on each end of existing row:
+Instruction: "Place a blue block on each end of the red row"
+Existing: Red row at x=-200,-100,0,100,200 z=0
+{"steps": [
+  {"action":"place","color":"Blue","count":1,"position":{"x":-200,"z":0}},
+  {"action":"place","color":"Blue","count":1,"position":{"x":200,"z":0}}
+]}
+
+Example 4 — T-shape extend stem:
+Instruction: "Extend the T-shape stem by 2 blocks"
+Existing: crossbar x=-200 to 200 at z=0, stem x=0 from z=0 to z=200
+{"steps": [
+  {"action":"extend_row","color":"Red","count":2,"position":{"x":0,"z":300},"direction":"front"}
+]}
+
+Example 5 — Row from middle going left:
+Instruction: "Place a row of 4 blue blocks from the middle going left"
+{"steps": [
+  {"action":"extend_row","color":"Blue","count":4,"position":{"x":0,"z":0},"direction":"left"}
+]}
+
+Example 6 — Extend existing row to the left:
+Instruction: "Extend the red row 3 blocks to the left"
+Existing: Red row at x=0,100,200 z=0
+{"steps": [
+  {"action":"extend_row","color":"Red","count":3,"position":{"x":-100,"z":0},"direction":"left"}
+]}
+
+Example 7 — Two separate stacks side by side:
+Instruction: "Place a red stack of 3 and a blue stack of 2 next to each other"
+{"steps": [
+  {"action":"stack","color":"Red","count":3,"position":{"x":0,"z":0}},
+  {"action":"stack","color":"Blue","count":2,"position":{"x":100,"z":0}}
+]}
+
+Example 8 — On top of existing stack:
+Instruction: "Place a green block on top of the red stack"
+Existing: Red stack at (0,0)
+{"steps": [
+  {"action":"stack","color":"Green","count":1,"position":{"x":0,"z":0}}
+]}
+
+Example 9 — L-shape arm extension:
+Instruction: "Extend the L-shape arm by 2 blocks"
+Existing: L-shape arm at x=0,100,200 z=0
+{"steps": [
+  {"action":"extend_row","color":"Red","count":2,"position":{"x":300,"z":0},"direction":"right"}
+]}
 
 OUTPUT: {"steps": [...]} — JSON only, no explanation.
 """

@@ -25,11 +25,17 @@ class StructureInfo:
         parts = []
 
         for t in self.t_shapes:
+            longer_base_info = ""
+            if "longer_base" in t:
+                longer_base_info = f", longer_base={t['longer_base']} ({t.get('crossbar_len', '?')} vs {t.get('stem_len', '?')} blocks)"
             parts.append(
-                f"T-shape ({t['color']}): crossbar from ({t['crossbar_start'][0]},{t['crossbar_start'][1]}) "
+                f"T-shape ({t['color']}): crossbar {t.get('crossbar_len', '?')} blocks "
+                f"from ({t['crossbar_start'][0]},{t['crossbar_start'][1]}) "
                 f"to ({t['crossbar_end'][0]},{t['crossbar_end'][1]}) along {'x' if t['crossbar_axis'] == 'x' else 'z'}-axis, "
-                f"stem at ({t['stem_base'][0]},{t['stem_base'][1]}) extending {'along z' if t['stem_axis'] == 'z' else 'along x'} "
-                f"to ({t['stem_tip'][0]},{t['stem_tip'][1]}), junction at ({t['junction'][0]},{t['junction'][1]})."
+                f"stem {t.get('stem_len', '?')} blocks from ({t['stem_base'][0]},{t['stem_base'][1]}) "
+                f"extending {'along z' if t['stem_axis'] == 'z' else 'along x'} "
+                f"to ({t['stem_tip'][0]},{t['stem_tip'][1]}), junction at ({t['junction'][0]},{t['junction'][1]})"
+                f"{longer_base_info}."
             )
 
         for l in self.l_shapes:
@@ -48,8 +54,11 @@ class StructureInfo:
             )
 
         for stack in self.stacks:
+            layer_info = ""
+            if "layers" in stack:
+                layer_info = f" colors bottom-to-top: [{', '.join(stack['layers'])}]"
             parts.append(
-                f"Stack of {stack['height']} {stack['color']} blocks at ({stack['x']},{stack['z']})."
+                f"Stack of {stack['height']} {stack['color']} blocks at ({stack['x']},{stack['z']}){layer_info}."
             )
 
         for single in self.singles:
@@ -162,13 +171,20 @@ def analyze_structure(grid: Grid) -> StructureInfo:
 
 def _add_stacks(info: StructureInfo, blocks: List[Block], color: str, y_ground: int):
     """Add stack info for blocks above ground level."""
-    pos_counts: Dict[Tuple[int, int], int] = {}
+    pos_blocks: Dict[Tuple[int, int], List[Block]] = {}
     for b in blocks:
         key = (b.x, b.z)
-        pos_counts[key] = pos_counts.get(key, 0) + 1
-    for (x, z), count in pos_counts.items():
-        if count > 1:
-            info.stacks.append({"color": color, "x": x, "z": z, "height": count})
+        pos_blocks.setdefault(key, []).append(b)
+    for (x, z), blist in pos_blocks.items():
+        if len(blist) > 1:
+            sorted_blocks = sorted(blist, key=lambda b: b.y)
+            info.stacks.append({
+                "color": color,
+                "x": x,
+                "z": z,
+                "height": len(blist),
+                "layers": [b.color for b in sorted_blocks],
+            })
 
 
 def _detect_lines(positions: list, color: str) -> list:
@@ -290,6 +306,9 @@ def _detect_t_shape(positions: list, color: str) -> dict | None:
                 if stem_zs:
                     stem_zs.sort()
                     stem_tip_z = stem_zs[-1] if stem_zs[-1] != jz else stem_zs[0]
+                    crossbar_len = len(coords)
+                    stem_len = len(stem_zs) + 1  # +1 for junction
+                    longer_base = "crossbar" if crossbar_len >= stem_len else "stem"
                     return {
                         "color": color,
                         "crossbar_axis": "x",
@@ -299,6 +318,9 @@ def _detect_t_shape(positions: list, color: str) -> dict | None:
                         "stem_base": (jx, jz),
                         "stem_tip": (jx, stem_tip_z),
                         "junction": (jx, jz),
+                        "longer_base": longer_base,
+                        "crossbar_len": crossbar_len,
+                        "stem_len": stem_len,
                     }
             else:
                 jx, jz = fixed, junction
@@ -311,6 +333,9 @@ def _detect_t_shape(positions: list, color: str) -> dict | None:
                 if stem_xs:
                     stem_xs.sort()
                     stem_tip_x = stem_xs[-1] if stem_xs[-1] != jx else stem_xs[0]
+                    crossbar_len = len(coords)
+                    stem_len = len(stem_xs) + 1  # +1 for junction
+                    longer_base = "crossbar" if crossbar_len >= stem_len else "stem"
                     return {
                         "color": color,
                         "crossbar_axis": "z",
@@ -320,6 +345,9 @@ def _detect_t_shape(positions: list, color: str) -> dict | None:
                         "stem_base": (jx, jz),
                         "stem_tip": (stem_tip_x, jz),
                         "junction": (jx, jz),
+                        "longer_base": longer_base,
+                        "crossbar_len": crossbar_len,
+                        "stem_len": stem_len,
                     }
 
     return None
