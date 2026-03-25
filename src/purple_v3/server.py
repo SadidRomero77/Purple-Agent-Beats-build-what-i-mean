@@ -199,33 +199,17 @@ class PurpleAgent(AgentExecutor):
     def _ev_should_ask(
         self, ambiguity_type: str, instruction: str, grid: Grid, speaker: str
     ) -> bool:
-        """Return True if EV(ask) > EV(guess) for this ambiguity type."""
-        # Hard cap: never exceed 20% ask rate
-        ctx_id = "default"  # Will be overridden by caller
-        rounds = max(sum(self._round_count.values()), 1)
-        asks = sum(self._ask_count.values())
-        if rounds >= 5 and asks / rounds > 0.20:
-            return False
+        """Return True if EV(ask) > EV(guess) for this ambiguity type.
 
-        # Speaker model: if speaker is reliable, don't ask
-        if speaker and not self._speaker_model.should_ask(speaker, ambiguity_type):
-            return False
-
-        ev_ask = -5 + 0.95 * 10  # = +4.5 (green answers correctly ~95%)
-
-        if ambiguity_type == "color":
-            # Empirical: color inference accuracy ~54% even with single color context.
-            # EV(guess) = 0.54*10 - 0.46*10 = +0.8 < EV(ask)=+4.5 → always ask.
-            ev_guess = 0.54 * 10 - 0.46 * 10  # = +0.8
-            return ev_ask > ev_guess  # Always True
-
-        elif ambiguity_type == "count":
-            # Empirical: count inference accuracy ~64.6%.
-            # EV(guess) = 0.646*10 - 0.354*10 = +2.92 < EV(ask)=+4.5 → always ask.
-            ev_guess = 0.646 * 10 - 0.354 * 10  # = +2.92
-            return ev_ask > ev_guess  # Always True
-
-        return False
+        Empirical calibration from competition data:
+        - EV(ask) = -5 + 0.95*10 = +4.5 (green answers correctly ~95%)
+        - EV(guess color) = 0.54*10 - 0.46*10 = +0.8  → always ask
+        - EV(guess count) = 0.646*10 - 0.354*10 = +2.92 → always ask
+        Note: No hard cap and no speaker model suppression — both are harmful.
+        The per-round self._asked guard already prevents asking >1x per round.
+        """
+        # Always ask when ambiguity detected — EV(ask) > EV(guess) in all cases
+        return True
 
     # ── Main execute ──
 
@@ -361,14 +345,6 @@ class PurpleAgent(AgentExecutor):
             patched = patch_instruction_with_color(orig_parsed.instruction_text, color_str)
             orig_parsed.instruction_text = patched
             response = await self._skills_pipeline(orig_parsed, ctx_id, orig_input)
-
-        # Re-verification guard
-        if response and response.startswith("[BUILD]"):
-            start_count = len(orig_parsed.start_grid.blocks)
-            response_blocks = response.count(";")
-            if response_blocks > 0 and (response_blocks > start_count + 15 or response_blocks < start_count):
-                logger.warning("Re-verification: %d blocks vs %d start — fallback", response_blocks, start_count)
-                response = None
 
         if response is None:
             hint = f"\n\nThe answer is: {color_str}"
